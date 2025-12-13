@@ -1,4 +1,6 @@
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from edge_midpoint_egnn import EdgeMidpointEGNN
 

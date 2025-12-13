@@ -50,6 +50,11 @@ You can pass a custom builder instance to the model constructor for fine-grained
 - `edge_midpoint_egnn.graph` – graph builders and the `MidpointGraph` dataclass.
 - `edge_midpoint_egnn.model` – the `EdgeMidpointEGNN` model, encoder, and invariant readout head.
 - `edge_midpoint_egnn.layers` – an SE(2)-equivariant message-passing layer with vector transport between frames.
+- `edge_midpoint_egnn.baseline` – a reflection-invariant EGNN baseline that uses only pairwise distances.
+
+## Examples
+
+- `examples/parity_detection.py` trains the edge-midpoint EGNN and a baseline EGNN on a chiral 2D point-cloud dataset and reports accuracy alongside a null test that verifies neither model hallucinates parity when labels are random.
 
 ## Model summary
 
