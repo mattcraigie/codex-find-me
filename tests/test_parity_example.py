@@ -1,6 +1,8 @@
 import pytest
 
-torch = pytest.importorskip("torch")
+torch = pytest.importorskip(
+    "torch", reason="PyTorch is required; install via `pip install -r requirements.txt`"
+)
 
 from examples.parity_detection import train_parity_classifiers
 

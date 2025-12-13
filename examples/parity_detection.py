@@ -60,7 +60,7 @@ class ParityPointCloudDataset(torch.utils.data.Dataset):
         label = torch.randint(0, 2, (1,), generator=g).item() if self.null_labels else idx % 2
 
         points = self.prototype.clone()
-        points += torch.randn_like(points, generator=g) * self.noise
+        points += torch.randn(points.shape, generator=g) * self.noise
 
         if label == 1:
             points[:, 1] = -points[:, 1]

@@ -9,6 +9,9 @@ pip install -e .
 ```
 
 This installs the `edge_midpoint_egnn` package with a minimal dependency on PyTorch.
+If your environment cannot download PyTorch wheels directly, install an appropriate
+CPU or CUDA wheel manually (see https://pytorch.org/get-started/locally/) before
+running the package tests.
 
 ## Quickstart
 
