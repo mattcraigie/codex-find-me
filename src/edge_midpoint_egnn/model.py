@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
 
 from .graph import EdgeMidpointGraphBuilder, MidpointGraph
-from .layers import EdgeMidpointEGNNLayer, make_mlp
+from .layers import EdgeMidpointEGNNLayer, make_mlp, scatter_sum
 
 
 class EdgeMidpointEncoder(nn.Module):
@@ -88,7 +88,12 @@ class EdgeMidpointEGNN(nn.Module):
         positions: torch.Tensor,
         features: Optional[torch.Tensor] = None,
         return_graph: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[MidpointGraph]]:
+        return_node_features: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor, Optional[MidpointGraph]],
+        Tuple[torch.Tensor, MidpointGraph],
+        torch.Tensor,
+    ]:
         graph = self.build_graph(positions, features)
         h, v = self.encoder(graph)
         for layer in self.layers:
@@ -98,6 +103,23 @@ class EdgeMidpointEGNN(nn.Module):
             output = self.readout(h)
         else:
             output = None
+
+        if return_node_features:
+            endpoints = graph.endpoints
+            num_points = graph.endpoint_pos.shape[0]
+            flat_endpoints = endpoints.reshape(-1)
+            repeated_midpoints = h.repeat_interleave(2, dim=0)
+            scalars = scatter_sum(repeated_midpoints, flat_endpoints, num_points)
+            counts = scatter_sum(
+                torch.ones((flat_endpoints.shape[0], 1), device=h.device, dtype=h.dtype),
+                flat_endpoints,
+                num_points,
+            )
+            counts = torch.clamp(counts, min=1.0)
+            node_scalars = scalars / counts
+            if return_graph:
+                return node_scalars, graph
+            return node_scalars
 
         if return_graph:
             return h, v, graph, output

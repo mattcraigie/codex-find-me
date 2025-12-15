@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -55,9 +55,9 @@ class BaselineEGNN(nn.Module):
     ) -> None:
         super().__init__()
         self.k = k
+        self.scalar_dim = scalar_dim
         input_dim = in_features if in_features is not None else 0
-        input_dim += 1  # edge length
-        self.encoder = make_mlp(input_dim, hidden_dim, scalar_dim)
+        self.encoder = make_mlp(max(1, input_dim), hidden_dim, scalar_dim)
         self.layers = nn.ModuleList(
             [BaselineEGNNLayer(scalar_dim, hidden_dim) for _ in range(n_layers)]
         )
@@ -81,7 +81,12 @@ class BaselineEGNN(nn.Module):
         positions: torch.Tensor,
         features: Optional[torch.Tensor] = None,
         return_graph: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]]:
+        return_node_features: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]],
+        Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        torch.Tensor,
+    ]:
         positions = positions.float()
         if features is not None:
             features = features.float()
@@ -89,16 +94,22 @@ class BaselineEGNN(nn.Module):
         senders, receivers = self.build_edges(positions)
         d = positions[senders] - positions[receivers]
         lengths = torch.linalg.norm(d, dim=-1, keepdim=True)
+
         if features is None:
-            feat_cat = lengths
+            node_inputs = torch.ones((positions.shape[0], 1), device=positions.device)
         else:
-            feat_cat = torch.cat([features[senders], lengths], dim=-1)
-        h = self.encoder(feat_cat)
+            node_inputs = features
+        h = self.encoder(node_inputs)
 
         for layer in self.layers:
             h = layer(h, positions, senders, receivers)
 
         out = self.readout(h.mean(dim=0, keepdim=True)) if self.readout is not None else None
+
+        if return_node_features:
+            if return_graph:
+                return h, (senders, receivers)
+            return h
 
         if return_graph:
             return h, (senders, receivers), out

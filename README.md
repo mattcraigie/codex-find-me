@@ -57,7 +57,7 @@ You can pass a custom builder instance to the model constructor for fine-grained
 
 ## Examples
 
-- `examples/parity_detection.py` trains the edge-midpoint EGNN and a baseline EGNN on a chiral 2D point-cloud dataset and reports accuracy alongside a null test that verifies neither model hallucinates parity when labels are random.
+- `examples/parity_detection.py` runs a parity-violation detection task where both models propagate over a single fixed 3D point set (10k nodes) and only the stochastic readout varies per step; it reports accuracy and a null-test score to ensure parity symmetry is respected.
 
 ## Model summary
 
