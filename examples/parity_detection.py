@@ -99,12 +99,10 @@ class Trainer:
 # -----------------------------
 
 
-def _random_rotation_3d(g: torch.Generator, device: torch.device) -> torch.Tensor:
-    a = torch.empty(3, 3, device=device).uniform_(-1.0, 1.0, generator=g)
-    q, _ = torch.linalg.qr(a)
-    if torch.det(q) < 0:
-        q[:, 0] = -q[:, 0]
-    return q
+def _random_rotation_2d(g: torch.Generator, device: torch.device) -> torch.Tensor:
+    theta = torch.empty(1, device=device).uniform_(0.0, 2 * torch.pi, generator=g)
+    cos, sin = torch.cos(theta), torch.sin(theta)
+    return torch.stack([torch.stack([cos, -sin]), torch.stack([sin, cos])]).squeeze(2)
 
 
 def _build_fixed_global_pointset(
@@ -115,7 +113,7 @@ def _build_fixed_global_pointset(
 ) -> torch.Tensor:
     """
     Build exactly n_points_total points by placing (n_points_total/4) chiral
-    tetrahedra on a jittered uniform grid (rare overlap), then apply ONE global
+    2D motifs on a jittered uniform grid (rare overlap), then apply ONE global
     random rotation+translation. No further stochasticity.
     """
 
@@ -124,12 +122,13 @@ def _build_fixed_global_pointset(
 
     g = torch.Generator(device=device).manual_seed(seed)
 
+    # 2D chiral quad (non-reflection-invariant) so parity is meaningful.
     template = torch.tensor(
         [
-            [0.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.35, 0.9, 0.0],
-            [0.55, 0.35, 0.65],
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.35, 0.9],
+            [0.55, 0.35],
         ],
         device=device,
         dtype=torch.float32,
@@ -139,28 +138,27 @@ def _build_fixed_global_pointset(
     spacing = 7e-2
     jitter = 1e-2  # uniform jitter
 
-    n_tetra = n_points_total // 4
+    n_motifs = n_points_total // 4
 
-    side = int(torch.ceil(torch.tensor(float(n_tetra) ** (1 / 3))).item())
+    side = int(torch.ceil(torch.tensor(float(n_motifs) ** 0.5)).item())
     coords = torch.stack(
         torch.meshgrid(
-            torch.arange(side, device=device),
             torch.arange(side, device=device),
             torch.arange(side, device=device),
             indexing="ij",
         ),
         dim=-1,
-    ).reshape(-1, 3)[:n_tetra].float()
+    ).reshape(-1, 2)[:n_motifs].float()
 
     centers = coords * spacing
     centers = centers + torch.empty_like(centers).uniform_(-jitter, jitter, generator=g)
 
-    tet = template * edge_scale
-    points = (centers[:, None, :] + tet[None, :, :]).reshape(n_points_total, 3)
+    motif = template * edge_scale
+    points = (centers[:, None, :] + motif[None, :, :]).reshape(n_points_total, 2)
 
-    R = _random_rotation_3d(g, device=device)
+    R = _random_rotation_2d(g, device=device)
     points = points @ R.T
-    translation = torch.empty(1, 3, device=device).uniform_(-0.5, 0.5, generator=g)
+    translation = torch.empty(1, 2, device=device).uniform_(-0.5, 0.5, generator=g)
     points = points + translation
 
     return points
@@ -190,7 +188,7 @@ class FullGraphSampleDataset(Dataset):
     def __init__(
         self,
         *,
-        positions: torch.Tensor,  # (N, 3) fixed
+        positions: torch.Tensor,  # (N, 2) fixed
         label: int,  # 0 or 1
         steps: int,
         base_seed: int,
@@ -221,7 +219,7 @@ class NullFullGraphDataset(Dataset):
     def __init__(
         self,
         *,
-        positions: torch.Tensor,  # (N, 3) fixed
+        positions: torch.Tensor,  # (N, 2) fixed
         steps: int,
         base_seed: int,
     ) -> None:
@@ -315,7 +313,6 @@ class FullGraphStochasticReadoutClassifier(ExperimentModule):
         self.criterion = nn.CrossEntropyLoss()
 
     def _sample_subsets(self, N: int, step_seed: int, device: torch.device) -> torch.Tensor:
-        g = torch.Generator(device=device).manual_seed(int(step_seed))
         idx = []
         for k in range(self.K):
             gk = torch.Generator(device=device).manual_seed(int(step_seed) + 10_000 * (k + 1))
