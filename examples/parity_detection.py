@@ -148,7 +148,16 @@ def train_parity_classifiers(
         )
 
     def edge_forward(model: EdgeMidpointEGNN, positions: torch.Tensor) -> torch.Tensor:
-        _, _, _, out = model(positions, return_graph=True)
+        result = model(positions, return_graph=True)
+        # Older versions of the model may return only three outputs even when
+        # ``return_graph`` is True; handle both shapes defensively to keep the
+        # example robust across environments.
+        if len(result) == 4:
+            _, _, _, out = result
+        elif len(result) == 3:
+            _, _, out = result
+        else:  # pragma: no cover - unexpected
+            raise ValueError(f"Unexpected model output arity: {len(result)}")
         return out
 
     def baseline_forward(model: BaselineEGNN, positions: torch.Tensor) -> torch.Tensor:
