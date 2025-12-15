@@ -56,13 +56,19 @@ class ParityPointCloudDataset(torch.utils.data.Dataset):
         return self.n_samples
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if idx < 0 or idx >= self.n_samples:  # guard against accidental reuse
+            raise IndexError
+
         g = torch.Generator().manual_seed(self.base_seed + idx)
         label = torch.randint(0, 2, (1,), generator=g).item() if self.null_labels else idx % 2
 
         points = self.prototype.clone()
         points += torch.randn(points.shape, generator=g) * self.noise
 
-        if label == 1:
+        reflect = (
+            torch.randint(0, 2, (1,), generator=g).item() if self.null_labels else label
+        )
+        if reflect == 1:
             points[:, 1] = -points[:, 1]
 
         theta = torch.rand((), generator=g) * (2 * torch.pi)
