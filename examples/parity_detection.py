@@ -52,33 +52,45 @@ class ParityPointCloudDataset(torch.utils.data.Dataset):
             ]
         )
 
+        self.positions: list[torch.Tensor] = []
+        self.labels: list[torch.Tensor] = []
+        self._generate_samples()
+
     def __len__(self) -> int:  # pragma: no cover - trivial
         return self.n_samples
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if idx < 0 or idx >= self.n_samples:  # guard against accidental reuse
             raise IndexError
+        return self.positions[idx], self.labels[idx]
 
-        g = torch.Generator().manual_seed(self.base_seed + idx)
-        label = torch.randint(0, 2, (1,), generator=g).item() if self.null_labels else idx % 2
+    def _generate_samples(self) -> None:
+        for idx in range(self.n_samples):
+            g = torch.Generator().manual_seed(self.base_seed + idx)
+            label = (
+                torch.randint(0, 2, (1,), generator=g).item()
+                if self.null_labels
+                else idx % 2
+            )
 
-        points = self.prototype.clone()
-        points += torch.randn(points.shape, generator=g) * self.noise
+            points = self.prototype.clone()
+            points += torch.randn(points.shape, generator=g) * self.noise
 
-        reflect = (
-            torch.randint(0, 2, (1,), generator=g).item() if self.null_labels else label
-        )
-        if reflect == 1:
-            points[:, 1] = -points[:, 1]
+            reflect = (
+                torch.randint(0, 2, (1,), generator=g).item() if self.null_labels else label
+            )
+            if reflect == 1:
+                points[:, 1] = -points[:, 1]
 
-        theta = torch.rand((), generator=g) * (2 * torch.pi)
-        cos, sin = torch.cos(theta), torch.sin(theta)
-        rot = torch.stack([torch.stack([cos, -sin]), torch.stack([sin, cos])])
-        points = points @ rot.T
-        translation = torch.randn(1, 2, generator=g) * 0.2
-        points = points + translation
+            theta = torch.rand((), generator=g) * (2 * torch.pi)
+            cos, sin = torch.cos(theta), torch.sin(theta)
+            rot = torch.stack([torch.stack([cos, -sin]), torch.stack([sin, cos])])
+            points = points @ rot.T
+            translation = torch.randn(1, 2, generator=g) * 0.2
+            points = points + translation
 
-        return points.float(), torch.tensor(label, dtype=torch.long)
+            self.positions.append(points.float())
+            self.labels.append(torch.tensor(label, dtype=torch.long))
 
 
 def _train_epoch(
