@@ -1,32 +1,53 @@
 import pytest
 
+# Skip if torch or dlutils are unavailable in the environment
 torch = pytest.importorskip(
     "torch", reason="PyTorch is required; install via `pip install -r requirements.txt`"
 )
+dlutils = pytest.importorskip(
+    "dlutils", reason="dlutils is required for the parity example; install via requirements"
+)
 
-from examples.parity_detection import TrainConfig, run
+from examples.parity_detection import (
+    create_parity_violating_mocks_2d,
+    train_and_test_model,
+)
 
 
-def test_parity_example_demonstrates_parity_detection():
-    torch.manual_seed(123)
-    cfg = TrainConfig(
+def test_parity_example_minimal_training(tmp_path):
+    torch.manual_seed(0)
+
+    mock_kwargs = {
+        "field_size": 8,
+        "total_num_triangles": 3,
+        "ratio_left": 0.5,
+        "length_side1": 2.0,
+        "length_side2": 1.0,
+        "min_scale": 1.0,
+        "max_scale": 1.0,
+    }
+    training_kwargs = {
+        "num_train_val_mocks": 32,
+        "num_test_mocks": 16,
+        "epochs": 1,
+        "lr": 1e-3,
+    }
+
+    # Quick shape sanity check on mock generation
+    mocks = create_parity_violating_mocks_2d(4, **mock_kwargs)
+    assert mocks.shape == (4, mock_kwargs["field_size"], mock_kwargs["field_size"])
+
+    results = train_and_test_model(
+        model_type="simple_cnn",
+        model_name="triangle_parity_test",
+        model_kwargs={"field_size": mock_kwargs["field_size"]},
+        mock_kwargs=mock_kwargs,
+        training_kwargs=training_kwargs,
+        output_root=str(tmp_path),
+        repeats=1,
         device=torch.device("cpu"),
-        epochs=2,
-        n_points_total=512,
-        test_points=128,
-        bag_size=64,
-        K=2,
-        steps_per_epoch=6,
     )
 
-    metrics = run(cfg)
-
-    for acc in (metrics.edge_acc, metrics.baseline_acc, metrics.null_edge_acc, metrics.null_baseline_acc):
-        assert 0.0 <= acc <= 1.0
-
-    # Edge model should not underperform baseline on average
-    assert metrics.edge_acc >= metrics.baseline_acc - 0.2
-
-    # Null datasets should stay near chance
-    assert abs(metrics.null_edge_acc - 0.5) <= 0.3
-    assert abs(metrics.null_baseline_acc - 0.5) <= 0.3
+    assert "val_scores" in results and "test_scores" in results
+    assert results["val_scores"].shape[0] == 1
+    assert results["test_scores"].shape[0] == 1

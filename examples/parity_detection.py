@@ -1,501 +1,311 @@
-"""Parity-violation detection with full-graph propagation + stochastic readout."""
+"""
+Minimal 2D parity-violation toy example using simple triangle mocks.
+The example mirrors the reference snippet with dlutils DataHandler/RegressionTrainer
+and a straightforward batch-difference loss.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Optional
+import os
+import time
+from typing import Dict, Tuple
 
+import numpy as np
 import torch
+from dlutils.data import DataHandler, RotatedDataset
+from dlutils.training import RegressionTrainer
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
 
-from edge_midpoint_egnn import BaselineEGNN, EdgeMidpointEGNN
-
-
-# -----------------------------
-# Framework primitives (new)
-# -----------------------------
+# ----------------------
+# Triangle mock helpers
+# ----------------------
 
 
-@dataclass
-class TrainConfig:
-    device: torch.device
-    epochs: int = 50
-    lr: float = 3e-3
-    weight_decay: float = 1e-6
-
-    # Global dataset size (fixed, generated once)
-    n_points_total: int = 10_000
-    test_points: int = 1_000  # held-out nodes from the same fixed cloud
-
-    # Stochastic readout
-    bag_size: int = 1_000  # subset size used to estimate mean statistic
-    K: int = 4  # number of independent subsets per step
-    steps_per_epoch: int = 128  # number of steps per epoch (each step = new subsets)
-
-    # DataLoader
-    batch_size: int = 1  # each item is a full-graph sample (train or test)
-    num_workers: int = 0
-
-    seed: int = 42
+def random_unit_vector_2d(num_vectors: int) -> np.ndarray:
+    vec = np.random.randn(num_vectors, 2)
+    vec /= np.linalg.norm(vec, axis=1)[:, np.newaxis]
+    return vec
 
 
-@dataclass
-class Metrics:
-    edge_acc: float
-    baseline_acc: float
-    null_edge_acc: float
-    null_baseline_acc: float
+def get_random_orthog_vecs_2d(num_vectors: int) -> Tuple[np.ndarray, np.ndarray]:
+    i = random_unit_vector_2d(num_vectors)
+    j = np.stack([-i[:, 1], i[:, 0]], axis=1)
+    return i, j
 
 
-class ExperimentModule(nn.Module):
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        raise NotImplementedError
+def add_triangle_to_grid(size: int, a: float, b: float, num_triangles: int) -> np.ndarray:
+    grid = np.zeros((size, size), dtype=int)
 
-    def loss(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        raise NotImplementedError
+    x1, y1 = np.random.uniform(0, size, (2, num_triangles))
+    point_1 = np.stack([x1, y1], axis=1)
 
-    @torch.no_grad()
-    def predict(self, outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        raise NotImplementedError
+    direction_2, direction_3 = get_random_orthog_vecs_2d(num_triangles)
+
+    point_2 = point_1 + a * direction_2
+    point_3 = point_1 + b * direction_3
+
+    for p in [point_1, point_2, point_3]:
+        p_grid = np.round(p).astype(int) % size
+        np.add.at(grid, tuple(p_grid.T), 1)
+
+    return grid
 
 
-class Trainer:
-    def __init__(self, cfg: TrainConfig) -> None:
-        self.cfg = cfg
+def make_triangle_mocks(
+    num_mocks: int,
+    size: int,
+    a: float,
+    b: float,
+    num_triangles: int,
+    min_scale: float = 1.0,
+    max_scale: float = 1.0,
+) -> np.ndarray:
+    try:
+        min_scale = float(min_scale)
+        max_scale = float(max_scale)
+        if min_scale > max_scale or min_scale <= 0 or max_scale <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        min_scale = max_scale = 1.0
 
-    def fit(self, module: ExperimentModule, train_loader: DataLoader) -> None:
-        module.to(self.cfg.device)
-        opt = torch.optim.AdamW(
-            module.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay
+    all_mocks = np.zeros((num_mocks, size, size))
+
+    for i in range(num_mocks):
+        scale = np.random.uniform(min_scale, max_scale)
+        scaled_a = a * scale
+        scaled_b = b * scale
+        resulting_grid = add_triangle_to_grid(size, scaled_a, scaled_b, num_triangles)
+        all_mocks[i] = resulting_grid
+
+    return all_mocks
+
+
+def create_triangle_mock_set_2d(
+    num_mocks: int,
+    field_size: int,
+    total_num_triangles: int,
+    ratio_left: float,
+    length_side1: float,
+    length_side2: float,
+    min_scale: float = 1.0,
+    max_scale: float = 1.0,
+) -> np.ndarray:
+    num_left = round(total_num_triangles * ratio_left)
+    num_right = round(total_num_triangles * (1 - ratio_left))
+
+    fields_left = make_triangle_mocks(
+        num_mocks,
+        field_size,
+        length_side1,
+        length_side2,
+        num_left,
+        min_scale,
+        max_scale,
+    )
+    fields_right = make_triangle_mocks(
+        num_mocks,
+        field_size,
+        length_side1,
+        -length_side2,
+        num_right,
+        min_scale,
+        max_scale,
+    )
+
+    return fields_left + fields_right
+
+
+# ----------------------
+# Parity dataset helpers
+# ----------------------
+
+
+def create_parity_violating_mocks_2d(
+    num_mocks: int,
+    field_size: int = 16,
+    total_num_triangles: int = 3,
+    ratio_left: float = 0.5,
+    length_side1: float = 2.0,
+    length_side2: float = 1.5,
+    min_scale: float = 1.0,
+    max_scale: float = 1.0,
+) -> np.ndarray:
+    return create_triangle_mock_set_2d(
+        num_mocks,
+        field_size,
+        total_num_triangles,
+        ratio_left,
+        length_side1,
+        length_side2,
+        min_scale,
+        max_scale,
+    )
+
+
+# ----------------------
+# Model + loss
+# ----------------------
+
+
+class SimpleParityCNN(nn.Module):
+    def __init__(self, field_size: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 8, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
         )
+        self.head = nn.Linear(16, 1)
+        self.field_size = field_size
 
-        for _ in range(self.cfg.epochs):
-            module.train()
-            for batch in train_loader:
-                batch = {k: v.to(self.cfg.device) for k, v in batch.items()}
-                opt.zero_grad(set_to_none=True)
-                outputs = module(batch)
-                loss = module.loss(outputs, batch)
-                loss.backward()
-                opt.step()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.view(x.shape[0], 1, self.field_size, self.field_size)
+        feats = self.net(x).flatten(1)
+        return self.head(feats).squeeze(-1)
 
-    @torch.no_grad()
-    def evaluate(self, module: ExperimentModule, loader: DataLoader) -> float:
-        module.eval()
-        correct, total = 0, 0
+
+def batch_difference_loss(model: nn.Module, data: torch.Tensor) -> torch.Tensor:
+    gx = model(data)
+    gPx = model(data.flip(dims=(-1,)))
+
+    fx = gx - gPx
+    mu_B = fx.mean(0)
+    sigma_B = fx.std(0)
+    return -mu_B / sigma_B
+
+
+# ----------------------
+# Training entrypoint
+# ----------------------
+
+
+model_lookup: Dict[str, nn.Module] = {
+    "simple_cnn": SimpleParityCNN,
+}
+
+
+def get_parity_score(model: nn.Module, loader: torch.utils.data.DataLoader, device: torch.device) -> float:
+    model.eval()
+    scores = []
+    with torch.no_grad():
         for batch in loader:
-            batch = {k: v.to(self.cfg.device) for k, v in batch.items()}
-            outputs = module(batch)
-            pred = module.predict(outputs)
-            y = batch["label"]
-            correct += (pred == y).sum().item()
-            total += y.numel()
-        return correct / max(1, total)
+            batch = batch.to(device)
+            score = float(batch_difference_loss(model, batch).item())
+            scores.append(score)
+    return float(np.mean(scores)) if scores else 0.0
 
 
-# -----------------------------
-# Fixed synthetic point cloud
-# -----------------------------
+def train_and_test_model(
+    model_type: str,
+    model_name: str,
+    model_kwargs: Dict,
+    mock_kwargs: Dict,
+    training_kwargs: Dict,
+    output_root: str,
+    repeats: int = 1,
+    device: torch.device | None = None,
+):
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        model_class = model_lookup[model_type]
+    except KeyError:
+        raise KeyError(f"Unrecognized model type {model_type} for {model_name} analysis")
 
+    os.makedirs(output_root, exist_ok=True)
 
-def _random_rotation_2d(g: torch.Generator, device: torch.device) -> torch.Tensor:
-    theta = torch.empty(1, device=device).uniform_(0.0, 2 * torch.pi, generator=g)
-    cos, sin = torch.cos(theta), torch.sin(theta)
-    return torch.stack([torch.stack([cos, -sin]), torch.stack([sin, cos])]).squeeze(2)
+    validation_scores = []
+    test_scores = []
 
+    test_mocks = create_parity_violating_mocks_2d(training_kwargs["num_test_mocks"], **mock_kwargs)
+    test_mocks = torch.from_numpy(test_mocks).float().unsqueeze(1)
+    test_loader = DataHandler(test_mocks).make_single_dataloader(batch_size=32)
 
-def _build_fixed_global_pointset(
-    *,
-    n_points_total: int,
-    seed: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Build exactly n_points_total points by placing (n_points_total/4) chiral
-    2D motifs on a jittered uniform grid (rare overlap), then apply ONE global
-    random rotation+translation. No further stochasticity.
-    """
+    for repeat in range(repeats):
+        start = time.time()
 
-    if n_points_total % 4 != 0:
-        raise ValueError("n_points_total must be divisible by 4.")
+        np.random.seed(0)
+        torch.manual_seed(repeat)
 
-    g = torch.Generator(device=device).manual_seed(seed)
-
-    # 2D chiral quad (non-reflection-invariant) so parity is meaningful.
-    template = torch.tensor(
-        [
-            [0.0, 0.0],
-            [1.0, 0.0],
-            [0.35, 0.9],
-            [0.55, 0.35],
-        ],
-        device=device,
-        dtype=torch.float32,
-    )
-
-    edge_scale = 1e-2
-    spacing = 7e-2
-    jitter = 1e-2  # uniform jitter
-
-    n_motifs = n_points_total // 4
-
-    side = int(torch.ceil(torch.tensor(float(n_motifs) ** 0.5)).item())
-    coords = torch.stack(
-        torch.meshgrid(
-            torch.arange(side, device=device),
-            torch.arange(side, device=device),
-            indexing="ij",
-        ),
-        dim=-1,
-    ).reshape(-1, 2)[:n_motifs].float()
-
-    centers = coords * spacing
-    centers = centers + torch.empty_like(centers).uniform_(-jitter, jitter, generator=g)
-
-    motif = template * edge_scale
-    points = (centers[:, None, :] + motif[None, :, :]).reshape(n_points_total, 2)
-
-    R = _random_rotation_2d(g, device=device)
-    points = points @ R.T
-    translation = torch.empty(1, 2, device=device).uniform_(-0.5, 0.5, generator=g)
-    points = points + translation
-
-    return points
-
-
-def _reflect_points_x(points: torch.Tensor) -> torch.Tensor:
-    out = points.clone()
-    out[..., 0] = -out[..., 0]
-    return out
-
-
-# -----------------------------
-# Datasets: full-graph sample, with stochastic readout controlled by idx
-# -----------------------------
-
-
-class FullGraphSampleDataset(Dataset):
-    """
-    Produces items that each contain the FULL graph (train or test pool),
-    a label, and a seed to drive stochastic readout (subset sampling) inside
-    the module.
-
-    We use length = steps so DataLoader yields multiple steps per epoch,
-    while the underlying positions remain fixed.
-    """
-
-    def __init__(
-        self,
-        *,
-        positions: torch.Tensor,  # (N, 2) fixed
-        label: int,  # 0 or 1
-        steps: int,
-        base_seed: int,
-    ) -> None:
-        super().__init__()
-        self.positions = positions.cpu()
-        self.label = int(label)
-        self.steps = int(steps)
-        self.base_seed = int(base_seed)
-
-    def __len__(self) -> int:
-        return self.steps
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        step_seed = self.base_seed + idx
-        return {
-            "positions": self.positions.float(),
-            "label": torch.tensor(self.label, dtype=torch.long),
-            "step_seed": torch.tensor(step_seed, dtype=torch.long),
-        }
-
-
-class NullFullGraphDataset(Dataset):
-    """
-    Null: label and reflection are independent. Still uses full-graph propagation.
-    """
-
-    def __init__(
-        self,
-        *,
-        positions: torch.Tensor,  # (N, 2) fixed
-        steps: int,
-        base_seed: int,
-    ) -> None:
-        super().__init__()
-        self.positions = positions.cpu()
-        self.steps = int(steps)
-        self.base_seed = int(base_seed)
-
-    def __len__(self) -> int:
-        return self.steps
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        step_seed = self.base_seed + idx
-        return {
-            "positions": self.positions.float(),
-            "label": torch.tensor(0, dtype=torch.long),
-            "step_seed": torch.tensor(step_seed, dtype=torch.long),
-            "null_mode": torch.tensor(1, dtype=torch.long),
-        }
-
-
-# -----------------------------
-# Backbones (thin adapters): full-graph -> per-node scalar s_v
-# -----------------------------
-
-
-class EdgeMidpointNodeScalar(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.model = EdgeMidpointEGNN(
-            in_features=None,
-            scalar_dim=48,
-            vector_dim=12,
-            hidden_dim=96,
-            n_layers=3,
-            include_readout=False,
+        train_val_mocks = create_parity_violating_mocks_2d(
+            training_kwargs["num_train_val_mocks"], **mock_kwargs
         )
-        self.to_scalar = nn.Linear(48, 1)
+        train_val_mocks = torch.from_numpy(train_val_mocks).float().unsqueeze(1)
 
-    def forward(self, positions: torch.Tensor) -> torch.Tensor:
-        node_scalar = self.model(positions, return_node_features=True)
-        return self.to_scalar(node_scalar).squeeze(-1)
-
-
-class BaselineNodeScalar(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.model = BaselineEGNN(
-            in_features=None,
-            scalar_dim=48,
-            hidden_dim=96,
-            n_layers=3,
-            k=16,
-            include_readout=False,
+        data_handler = DataHandler(train_val_mocks)
+        train_loader, val_loader = data_handler.make_dataloaders(
+            batch_size=32,
+            shuffle_split=False,
+            shuffle_dataloaders=True,
+            val_fraction=0.2,
+            dataset_class=RotatedDataset,
         )
-        self.to_scalar = nn.Linear(48, 1)
 
-    def forward(self, positions: torch.Tensor) -> torch.Tensor:
-        node_scalar = self.model(positions, return_node_features=True)
-        return self.to_scalar(node_scalar).squeeze(-1)
+        model = model_class(**model_kwargs).to(device)
 
-
-# -----------------------------
-# Module: full-graph propagate + stochastic readout mean over subsets
-# -----------------------------
-
-
-class FullGraphStochasticReadoutClassifier(ExperimentModule):
-    """
-    For each step:
-      - run backbone on ALL nodes -> s (N,)
-      - sample K subsets of size bag_size (using step_seed)
-      - compute T_hat_k = mean(s[idx_k])
-      - classify each T_hat_k via head; average CE loss
-
-    Prediction:
-      - uses deterministic mean over ALL nodes: T_full = mean(s)
-    """
-
-    def __init__(self, backbone: nn.Module, bag_size: int, K: int, hidden: int = 64) -> None:
-        super().__init__()
-        self.backbone = backbone
-        self.bag_size = int(bag_size)
-        self.K = int(K)
-
-        self.head = nn.Sequential(
-            nn.Linear(1, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, 2),
+        trainer = RegressionTrainer(
+            model,
+            train_loader,
+            val_loader,
+            criterion=batch_difference_loss,
+            no_targets=True,
+            device=device,
         )
-        self.criterion = nn.CrossEntropyLoss()
-
-    def _sample_subsets(self, N: int, step_seed: int, device: torch.device) -> torch.Tensor:
-        idx = []
-        for k in range(self.K):
-            gk = torch.Generator(device=device).manual_seed(int(step_seed) + 10_000 * (k + 1))
-            idx_k = torch.randperm(N, generator=gk, device=device)[: self.bag_size]
-            idx.append(idx_k)
-        return torch.stack(idx, dim=0)
-
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        positions = batch["positions"].squeeze(0)
-        step_seed = int(batch["step_seed"].item())
-        N = positions.shape[0]
-
-        null_mode = int(batch.get("null_mode", torch.tensor(0, device=positions.device)).item())
-        if null_mode == 1:
-            g = torch.Generator(device=positions.device).manual_seed(step_seed + 777)
-            label = int(torch.randint(0, 2, (1,), generator=g, device=positions.device).item())
-            reflect = int(torch.randint(0, 2, (1,), generator=g, device=positions.device).item())
-        else:
-            label = int(batch["label"].item())
-            reflect = label
-
-        if reflect == 1:
-            positions = _reflect_points_x(positions)
-
-        s = self.backbone(positions)
-        if s.dim() != 1 or s.shape[0] != N:
-            raise ValueError(f"Expected backbone to return (N,), got {tuple(s.shape)}")
-
-        subset_idx = self._sample_subsets(N, step_seed, device=positions.device)
-        subset_means = (
-            s.index_select(0, subset_idx.reshape(-1)).view(self.K, self.bag_size).mean(dim=1)
+        trainer.run_training(
+            epochs=training_kwargs["epochs"],
+            lr=training_kwargs["lr"],
+            print_progress=False,
+            show_loss_plot=False,
         )
-        logits = self.head(subset_means.view(self.K, 1))
 
-        T_full = s.mean()
+        trainer.get_best_model()
 
-        return {
-            "logits_K": logits,
-            "label": torch.tensor(label, device=positions.device, dtype=torch.long),
-            "T_full": T_full,
-        }
+        val_scores = [float(batch_difference_loss(model, batch.to(device)).item()) for batch in val_loader]
+        validation_scores.append(float(np.mean(val_scores)))
 
-    def loss(self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-        y = outputs["label"].view(1).expand(outputs["logits_K"].shape[0])
-        return self.criterion(outputs["logits_K"], y)
+        test_scores.append(get_parity_score(model, test_loader, device))
 
-    @torch.no_grad()
-    def predict(self, outputs: Dict[str, torch.Tensor]) -> torch.Tensor:
-        logits = self.head(outputs["T_full"].view(1, 1))
-        return logits.argmax(dim=-1)
+        torch.save(model.state_dict(), os.path.join(output_root, f"{model_name}_repeat{repeat}.pt"))
+        np.save(os.path.join(output_root, f"{model_name}_repeat{repeat}_losses.npy"), trainer.losses)
 
+        print(f"Repeat {repeat} took {time.time() - start:.2f} seconds")
 
-# -----------------------------
-# Build single fixed dataset and loaders
-# -----------------------------
+    return {
+        "val_scores": np.array(validation_scores),
+        "test_scores": np.array(test_scores),
+    }
 
 
-def make_loaders(cfg: TrainConfig) -> Dict[str, DataLoader]:
-    cpu = torch.device("cpu")
-
-    global_positions = _build_fixed_global_pointset(
-        n_points_total=cfg.n_points_total,
-        seed=cfg.seed,
-        device=cpu,
+def main() -> None:  # pragma: no cover
+    mock_kwargs = {
+        "field_size": 16,
+        "total_num_triangles": 4,
+        "ratio_left": 0.6,
+        "length_side1": 2.0,
+        "length_side2": 1.5,
+        "min_scale": 0.8,
+        "max_scale": 1.2,
+    }
+    training_kwargs = {
+        "num_train_val_mocks": 256,
+        "num_test_mocks": 128,
+        "epochs": 3,
+        "lr": 1e-3,
+    }
+    results = train_and_test_model(
+        model_type="simple_cnn",
+        model_name="triangle_parity",
+        model_kwargs={"field_size": mock_kwargs["field_size"]},
+        mock_kwargs=mock_kwargs,
+        training_kwargs=training_kwargs,
+        output_root="./triangle_parity_runs",
+        repeats=1,
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
     )
-
-    g = torch.Generator(device=cpu).manual_seed(cfg.seed + 999)
-    perm = torch.randperm(cfg.n_points_total, generator=g)
-    test_idx = perm[: cfg.test_points]
-    train_idx = perm[cfg.test_points :]
-
-    train_positions = global_positions.index_select(0, train_idx)
-    test_positions = global_positions.index_select(0, test_idx)
-
-    train0 = FullGraphSampleDataset(
-        positions=train_positions,
-        label=0,
-        steps=cfg.steps_per_epoch,
-        base_seed=cfg.seed + 1000,
-    )
-    train1 = FullGraphSampleDataset(
-        positions=train_positions,
-        label=1,
-        steps=cfg.steps_per_epoch,
-        base_seed=cfg.seed + 2000,
-    )
-    train_ds = torch.utils.data.ConcatDataset([train0, train1])
-
-    test0 = FullGraphSampleDataset(
-        positions=test_positions,
-        label=0,
-        steps=max(64, cfg.steps_per_epoch // 2),
-        base_seed=cfg.seed + 3000,
-    )
-    test1 = FullGraphSampleDataset(
-        positions=test_positions,
-        label=1,
-        steps=max(64, cfg.steps_per_epoch // 2),
-        base_seed=cfg.seed + 4000,
-    )
-    test_ds = torch.utils.data.ConcatDataset([test0, test1])
-
-    null_ds = NullFullGraphDataset(
-        positions=test_positions,
-        steps=max(128, cfg.steps_per_epoch),
-        base_seed=cfg.seed + 5000,
-    )
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        drop_last=False,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        drop_last=False,
-    )
-    null_loader = DataLoader(
-        null_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        drop_last=False,
-    )
-
-    return {"train": train_loader, "test": test_loader, "null": null_loader}
-
-
-# -----------------------------
-# Run experiment
-# -----------------------------
-
-
-def run(cfg: Optional[TrainConfig] = None) -> Metrics:
-    cfg = cfg or TrainConfig(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    torch.manual_seed(cfg.seed)
-
-    loaders = make_loaders(cfg)
-    trainer = Trainer(cfg)
-
-    edge_module = FullGraphStochasticReadoutClassifier(
-        backbone=EdgeMidpointNodeScalar(),
-        bag_size=cfg.bag_size,
-        K=cfg.K,
-    )
-    base_module = FullGraphStochasticReadoutClassifier(
-        backbone=BaselineNodeScalar(),
-        bag_size=cfg.bag_size,
-        K=cfg.K,
-    )
-
-    trainer.fit(edge_module, loaders["train"])
-    trainer.fit(base_module, loaders["train"])
-
-    edge_acc = trainer.evaluate(edge_module, loaders["test"])
-    baseline_acc = trainer.evaluate(base_module, loaders["test"])
-
-    null_edge_acc = trainer.evaluate(edge_module, loaders["null"])
-    null_baseline_acc = trainer.evaluate(base_module, loaders["null"])
-
-    return Metrics(
-        edge_acc=edge_acc,
-        baseline_acc=baseline_acc,
-        null_edge_acc=null_edge_acc,
-        null_baseline_acc=null_baseline_acc,
-    )
-
-
-def main() -> None:
-    cfg = TrainConfig(device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    m = run(cfg)
-    print("Edge-midpoint (full-prop + stochastic readout) acc:", m.edge_acc)
-    print("Baseline (full-prop + stochastic readout) acc:", m.baseline_acc)
-    print("Null test (edge-midpoint):", m.null_edge_acc)
-    print("Null test (baseline):", m.null_baseline_acc)
+    print("Validation scores:", results["val_scores"])
+    print("Test scores:", results["test_scores"])
 
 
 if __name__ == "__main__":
     main()
-
-

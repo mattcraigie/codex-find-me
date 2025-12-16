@@ -57,7 +57,7 @@ You can pass a custom builder instance to the model constructor for fine-grained
 
 ## Examples
 
-- `examples/parity_detection.py` runs a parity-violation detection task where both models propagate over a single fixed 2D point set (10k nodes) and only the stochastic readout varies per step; it reports accuracy and a null-test score to ensure parity symmetry is respected.
+- `examples/parity_detection.py` provides a minimal 2D triangle-mock parity toy that uses `dlutils` data loaders and a tiny CNN with the batch-difference loss to demonstrate a parity-violating statistic.
 
 ## Model summary
 
